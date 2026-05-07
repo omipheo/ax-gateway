@@ -5203,36 +5203,21 @@ def _isolate_gateway_paths(monkeypatch, tmp_path):
     monkeypatch.setenv("AX_GATEWAY_DIR", str(tmp_path / "gw"))
 
 
-def test_sweep_hides_stale_agent_after_threshold(monkeypatch, tmp_path):
+def test_sweep_does_not_auto_hide_stale_agent(monkeypatch, tmp_path):
+    """Sweep must never mutate lifecycle_phase. Hide is operator-driven only."""
     _isolate_gateway_paths(monkeypatch, tmp_path)
-    monkeypatch.delenv("AX_GATEWAY_HIDE_AFTER_STALE_SECONDS", raising=False)
     client = _RecordingHeartbeatClient()
     daemon = _build_daemon(client)
     entry = _stale_hermes_entry("hermes-old", age_seconds=20 * 60)
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
-    assert entry["lifecycle_phase"] == "hidden"
-    assert "hidden_at" in entry
-    assert entry["hidden_reason"] == "stale"
+    assert entry.get("lifecycle_phase", "active") == "active"
+    assert "hidden_at" not in entry
+    assert "hidden_reason" not in entry
     recent = gateway_core.load_recent_gateway_activity()
-    assert any(r.get("event") == "managed_agent_hidden" for r in recent)
-
-
-def test_sweep_idempotent_for_already_hidden(monkeypatch, tmp_path):
-    _isolate_gateway_paths(monkeypatch, tmp_path)
-    client = _RecordingHeartbeatClient()
-    daemon = _build_daemon(client)
-    entry = _stale_hermes_entry("hermes-old", age_seconds=20 * 60)
-    registry = {"agents": [entry]}
-    session = {"token": "axp_u_test", "base_url": "http://x"}
-    daemon._sweep_lifecycle(registry, session=session)
-    daemon._sweep_lifecycle(registry, session=session)
-    hidden_events = [
-        r for r in gateway_core.load_recent_gateway_activity()
-        if r.get("event") == "managed_agent_hidden"
-    ]
-    assert len(hidden_events) == 1
-    assert len(client.heartbeats) == 1
+    assert not any(r.get("event") == "managed_agent_hidden" for r in recent)
+    # Upstream liveness signal still goes out — that's the sweep's only job.
+    assert client.heartbeats and client.heartbeats[0]["status"] == "stale"
 
 
 def test_sweep_skips_switchboard(monkeypatch, tmp_path):
@@ -5271,21 +5256,22 @@ def test_sweep_skips_service_account(monkeypatch, tmp_path):
     assert client.heartbeats == []
 
 
-def test_sweep_unhides_on_reconnect(monkeypatch, tmp_path):
+def test_sweep_does_not_auto_unhide_on_reconnect(monkeypatch, tmp_path):
+    """A user-hidden agent that reconnects stays hidden — operator intent
+    sticks across liveness changes. Only ``unhide`` (CLI / UI) restores it."""
     _isolate_gateway_paths(monkeypatch, tmp_path)
     client = _RecordingHeartbeatClient()
     daemon = _build_daemon(client)
     entry = _stale_hermes_entry("hermes-back", age_seconds=2.0, liveness="connected")
     entry["lifecycle_phase"] = "hidden"
     entry["hidden_at"] = gateway_core._now_iso()
-    entry["hidden_reason"] = "stale"
+    entry["hidden_reason"] = "operator_cleanup"
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test"})
-    assert entry["lifecycle_phase"] == "active"
-    assert "hidden_at" not in entry
-    assert "hidden_reason" not in entry
+    assert entry["lifecycle_phase"] == "hidden"
+    assert entry["hidden_reason"] == "operator_cleanup"
     recent = gateway_core.load_recent_gateway_activity()
-    assert any(r.get("event") == "managed_agent_unhidden" for r in recent)
+    assert not any(r.get("event") == "managed_agent_unhidden" for r in recent)
 
 
 def test_status_payload_filters_hidden_by_default(monkeypatch, tmp_path):
@@ -5583,9 +5569,10 @@ def test_lifecycle_signal_404_tolerant(monkeypatch, tmp_path):
     entry = _stale_hermes_entry("hermes-ghost", age_seconds=20 * 60)
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
-    # Hide still applied locally even though upstream said 404.
-    assert entry["lifecycle_phase"] == "hidden"
-    # Sticky last_lifecycle_signal updated → no infinite retry next tick.
+    # Sweep doesn't mutate lifecycle_phase regardless of upstream response.
+    assert entry.get("lifecycle_phase", "active") == "active"
+    # 404 counts as "platform doesn't know about this agent" — sticky signal
+    # still updated so we don't retry forever.
     assert entry["last_lifecycle_signal"]["phase"] == "stale"
 
 
@@ -5653,8 +5640,9 @@ def test_legacy_entry_without_lifecycle_phase_loads_as_active(monkeypatch, tmp_p
     }
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test"})
-    # Legacy entry got swept normally (treated as implicit active → hidden).
-    assert entry["lifecycle_phase"] == "hidden"
+    # Legacy entry stays active — sweep no longer auto-hides. The default
+    # ``active`` phase is implied for entries with no lifecycle_phase field.
+    assert entry.get("lifecycle_phase", "active") == "active"
 
 
 def test_send_local_session_message_extracts_mentions_when_client_omits_them():

@@ -5935,18 +5935,22 @@ class GatewayDaemon:
         *,
         session: dict[str, Any] | None,
     ) -> None:
-        """Per-tick sweep: hide stale agents, signal liveness transitions upstream.
+        """Per-tick sweep: signal liveness transitions upstream.
+
+        Hide and restore are operator-driven only. The sweep observes liveness
+        and signals deltas upstream; it never mutates ``lifecycle_phase``. Use
+        ``ax gateway agents hide`` / ``unhide`` (or the Cleanup UI) to change
+        lifecycle phase.
 
         - Skips system agents (switchboards, service accounts).
-        - Promotes active+stale entries past the hide threshold to lifecycle_phase=hidden.
-        - Auto-restores hidden entries that have come back online.
+        - Skips archived entries entirely (no upstream signaling either —
+          archive already signaled).
         - On any liveness delta vs last_lifecycle_signal.phase, calls
           send_heartbeat upstream best-effort. 404 counts as success.
         """
         agents = registry.get("agents") or []
         if not agents:
             return
-        threshold = _hide_after_stale_seconds(registry)
         client = self._sweep_client(session)
         for entry in agents:
             if not isinstance(entry, dict):
@@ -5954,43 +5958,15 @@ class GatewayDaemon:
             if _is_system_agent(entry):
                 continue
             liveness = str(entry.get("liveness") or "").strip().lower()
-            age_raw = entry.get("last_seen_age_seconds")
-            try:
-                age = float(age_raw) if age_raw is not None else None
-            except (TypeError, ValueError):
-                age = None
             phase = str(entry.get("lifecycle_phase") or "active").strip().lower()
             if phase not in _LIFECYCLE_PHASES:
                 phase = "active"
 
-            # Archived is sticky — sweep never transitions in or out of it. The
-            # only path in is `agents archive`; the only path out is
-            # `agents restore`. Skip both auto-hide and auto-restore for these
-            # entries, and skip upstream lifecycle signaling (the explicit
-            # archive call already signaled `archived` upstream).
+            # Archived is sticky — explicit archive already signaled upstream,
+            # don't double-signal. Hide/unhide are operator-only and the sweep
+            # never touches lifecycle_phase, so no transition logic here.
             if phase == "archived":
                 continue
-
-            # Hide transition: active → hidden once stale past threshold.
-            if (
-                phase == "active"
-                and liveness in {"stale", "offline", "setup_error"}
-                and age is not None
-                and age >= threshold
-            ):
-                entry["lifecycle_phase"] = "hidden"
-                entry["hidden_at"] = _now_iso()
-                entry["hidden_reason"] = liveness
-                record_gateway_activity("managed_agent_hidden", entry=entry, reason=liveness)
-                phase = "hidden"
-
-            # Auto-restore: hidden → active when reconnected and fresh.
-            elif phase == "hidden" and liveness == "connected" and (age is None or age <= RUNTIME_STALE_AFTER_SECONDS):
-                entry["lifecycle_phase"] = "active"
-                entry.pop("hidden_at", None)
-                entry.pop("hidden_reason", None)
-                record_gateway_activity("managed_agent_unhidden", entry=entry)
-                phase = "active"
 
             # Upstream signal on liveness delta. Sticky liveness rate-limits.
             if liveness in {"connected", "stale", "offline", "setup_error"}:
